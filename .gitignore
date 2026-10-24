@@ -1,0 +1,6 @@
+build/
+*.log
+*.ppm
+*.png
+__pycache__/
+venv/
