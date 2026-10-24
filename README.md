@@ -92,6 +92,7 @@ and XSOverlay's own `output_logs/` under
 | `XSO_UWC_DEBUG=1` | verbose DLL log with 5 s statistics (`requests/captured/input…`) |
 | `XSO_UWC_TRACE=1` | ring-buffer trace of every exported call + a watchdog that dumps it if `UwcUpdate` stops |
 | `XSO_NO_HELPER=1` | wrapper does not start/stop the helper |
+| `XSO_RELAUNCH=N` | relaunch XSOverlay up to N times (default 3) after it exits with code 130 because SteamVR's compositor crashed while SteamVR is still up |
 
 ## Repository layout
 

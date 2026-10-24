@@ -19,6 +19,9 @@
 #   XSO_INPUT=0      do not forward mouse/keyboard from XSOverlay to the X11 desktop
 #   XSO_UWC_DEBUG=1  verbose DLL log in /dev/shm/xso-uwc.log
 #   XSO_NO_HELPER=1  do not start/stop the helper (you run it yourself)
+#   XSO_RELAUNCH=N   relaunch XSOverlay up to N times (default 3) when it exits because
+#                    SteamVR's compositor died (exit code 130, "VR - QUIT - EVENT") while
+#                    SteamVR itself is still running (SteamVR-for-Linux#1006 crashes)
 
 here="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
 log="$here/xso-linux.log"
@@ -74,9 +77,21 @@ else
     echo "WARNING: could not locate the XSOverlay install dir from the command line; DLL not installed"
 fi
 
-"${args[@]}"
-rc=$?
-echo "XSOverlay exited with $rc"
+attempt=0
+while :; do
+    "${args[@]}"
+    rc=$?
+    echo "XSOverlay exited with $rc"
+    max="${XSO_RELAUNCH:-3}"
+    if [ "$rc" = "130" ] && [ "$attempt" -lt "$max" ] && pgrep -x vrmonitor >/dev/null 2>&1; then
+        attempt=$((attempt+1))
+        echo "SteamVR still running: XSOverlay probably lost the compositor (SteamVR bug #1006); relaunching ($attempt/$max) in 8 s"
+        for i in 1 2 3 4 5 6 7 8; do sleep 1; pgrep -x vrmonitor >/dev/null 2>&1 || break; done
+        pgrep -x vrmonitor >/dev/null 2>&1 || { echo "SteamVR exited; not relaunching"; break; }
+        continue
+    fi
+    break
+done
 
 if [ -n "$started_helper" ] && [ -n "$helper_pid" ]; then
     kill "$helper_pid" 2>/dev/null && echo "stopped xso-bridge"
