@@ -193,13 +193,15 @@ int main(int argc, char **argv)
         in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE; in[0].mi.dx = 32768; in[0].mi.dy = 32768;
         in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
         in[2].type = INPUT_MOUSE; in[2].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-        in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = 'A';
+        in[3].type = INPUT_KEYBOARD; in[3].ki.wVk = 'A'; in[3].ki.wScan = (WORD)MapVirtualKeyW('A', MAPVK_VK_TO_VSC);
         UINT n = SendInput(4, in, sizeof(INPUT));
-        INPUT up; memset(&up, 0, sizeof up); up.type = INPUT_KEYBOARD; up.ki.wVk = 'A'; up.ki.dwFlags = KEYEVENTF_KEYUP;
+        INPUT up; memset(&up, 0, sizeof up); up.type = INPUT_KEYBOARD; up.ki.wVk = 'A'; up.ki.wScan = in[3].ki.wScan; up.ki.dwFlags = KEYEVENTF_KEYUP;
         n += SendInput(1, &up, sizeof(INPUT));
+        INPUT arrow; memset(&arrow, 0, sizeof arrow); arrow.type = INPUT_KEYBOARD; arrow.ki.wVk = VK_UP; arrow.ki.wScan = (WORD)MapVirtualKeyW(VK_UP, MAPVK_VK_TO_VSC); arrow.ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+        n += SendInput(1, &arrow, sizeof(INPUT)); arrow.ki.dwFlags |= KEYEVENTF_KEYUP; n += SendInput(1, &arrow, sizeof(INPUT));
         INPUT wh; memset(&wh, 0, sizeof wh); wh.type = INPUT_MOUSE; wh.mi.dwFlags = MOUSEEVENTF_WHEEL; wh.mi.mouseData = (DWORD)-120;
         n += SendInput(1, &wh, sizeof(INPUT));
-        printf("SendInput returned %u (expect 6)\n", n);
+        printf("SendInput returned %u (expect 8)\n", n);
         Sleep(300);
     }
     DWORD t_end = GetTickCount();

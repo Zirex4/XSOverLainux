@@ -77,6 +77,7 @@ typedef struct pe_window {
     BYTE    *swizzle;            /* scratch for RGBA textures */
     size_t   swizzle_cap;
     uint32_t null_tex_reported_seq;
+    ID3D11Texture2D *tex_full_uploaded;  /* texture that received a full frame (partial updates allowed after) */
 } pe_window;
 
 static int              g_initialized;
@@ -316,6 +317,7 @@ static void sync_windows(void)
             p->pending_seq = 0; p->icon_req = 0; p->icon_gen_seen = e->icon_gen;
             p->tex_w = p->tex_h = 0;
             p->null_tex_reported_seq = 0;
+            p->tex_full_uploaded = NULL;
             copy_strings(p, e);
             add_message(MSG_WindowAdded, p->id, (void *)(uintptr_t)xid);
             if (g_debug_mode) xlog("window added id=%d xid=%08x flags=%x '%ls'", p->id, xid, e->flags, p->title);
@@ -369,7 +371,7 @@ static void swizzle_bgra_to_rgba(const BYTE *src, int src_stride, BYTE *dst, int
 }
 
 static int upload_pixels(ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, const BYTE *src, int stride, int w, int h,
-                         BYTE **scratch, size_t *scratch_cap, const char *what, int id)
+                         BYTE **scratch, size_t *scratch_cap, const char *what, int id, const int *rect /* x,y,w,h or NULL */)
 {
     D3D11_TEXTURE2D_DESC desc;
     ID3D11Texture2D_GetDesc(tex, &desc);
@@ -377,13 +379,21 @@ static int upload_pixels(ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, const B
         if (g_debug_mode) xlog("%s id=%d texture size %ux%u != frame %dx%d", what, id, desc.Width, desc.Height, w, h);
         return -1;
     }
+    int rx = 0, ry = 0, rw = w, rh = h;
+    if (rect && rect[2] > 0 && rect[3] > 0 && !(rect[0] == 0 && rect[1] == 0 && rect[2] == w && rect[3] == h)) {
+        rx = rect[0]; ry = rect[1]; rw = rect[2]; rh = rect[3];
+        if (rx < 0 || ry < 0 || rx + rw > w || ry + rh > h) { rx = 0; ry = 0; rw = w; rh = h; }
+    }
+    D3D11_BOX box = { (UINT)rx, (UINT)ry, 0, (UINT)(rx + rw), (UINT)(ry + rh), 1 };
+    const D3D11_BOX *pbox = (rx == 0 && ry == 0 && rw == w && rh == h) ? NULL : &box;
+    const BYTE *rsrc = src + (size_t)ry * (size_t)stride + (size_t)rx * 4;
     if (is_rgba(desc.Format)) {
-        size_t need = (size_t)w * (size_t)h * 4;
+        size_t need = (size_t)rw * (size_t)rh * 4;
         if (*scratch_cap < need) { BYTE *n = realloc(*scratch, need); if (!n) return 0; *scratch = n; *scratch_cap = need; }
-        swizzle_bgra_to_rgba(src, stride, *scratch, w, h);
-        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)tex, 0, NULL, *scratch, (UINT)(w * 4), 0);
+        swizzle_bgra_to_rgba(rsrc, stride, *scratch, rw, rh);
+        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)tex, 0, pbox, *scratch, (UINT)(rw * 4), 0);
     } else {
-        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)tex, 0, NULL, src, (UINT)stride, 0);
+        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)tex, 0, pbox, rsrc, (UINT)stride, 0);
     }
     return 1;
 }
@@ -434,7 +444,10 @@ static void render_all(void)
             }
             int w = e->frame_w, h = e->frame_h, stride = e->frame_stride;
             const BYTE *src = XSO_FRAME_PTR(g_shm, slot, half & 1u);
-            int r = upload_pixels(ctx, p->tex, src, stride, w, h, &p->swizzle, &p->swizzle_cap, "window", p->id);
+            int rect[4] = { e->dirty_x, e->dirty_y, e->dirty_w, e->dirty_h };
+            const int *prect = (p->tex_full_uploaded == p->tex) ? rect : NULL;   /* first upload to a texture is always full */
+            int r = upload_pixels(ctx, p->tex, src, stride, w, h, &p->swizzle, &p->swizzle_cap, "window", p->id, prect);
+            if (r > 0) { p->tex_full_uploaded = p->tex; __atomic_store_n(&e->ack_seq, seq, __ATOMIC_RELEASE); }
             __atomic_store_n(&e->reader_buf, XSO_NO_INDEX, __ATOMIC_RELEASE);
             if (r > 0) { add_message(MSG_WindowCaptured, p->id, (void *)(uintptr_t)p->xid); g_stat_captured++; }
             else if (r < 0) { add_message(MSG_TextureSizeError, p->id, NULL); g_stat_size++; }
@@ -443,7 +456,7 @@ static void render_all(void)
             p->icon_req = 0;
             if (p->icon_tex && e->icon_w > 0 && e->icon_h > 0) {
                 int r = upload_pixels(ctx, p->icon_tex, (const BYTE *)g_shm->icons[i], e->icon_w * 4, e->icon_w, e->icon_h,
-                                      &p->swizzle, &p->swizzle_cap, "icon", p->id);
+                                      &p->swizzle, &p->swizzle_cap, "icon", p->id, NULL);
                 if (r > 0) add_message(MSG_IconCaptured, p->id, (void *)(uintptr_t)p->xid);
             }
         }
@@ -453,7 +466,7 @@ static void render_all(void)
         if (g_cursor_tex && g_cursor_w > 0 && g_cursor_h > 0) {
             static size_t cap;
             int r = upload_pixels(ctx, g_cursor_tex, (const BYTE *)g_shm->cursor.pixels, g_cursor_w * 4, g_cursor_w, g_cursor_h,
-                                  &g_cursor_swizzle, &cap, "cursor", -1);
+                                  &g_cursor_swizzle, &cap, "cursor", -1, NULL);
             if (r > 0) add_message(MSG_CursorCaptured, -1, NULL);
         }
     }
@@ -528,7 +541,7 @@ static UINT WINAPI hook_SendInput(UINT count, LPINPUT inputs, int size)
             } else {
                 int vk = k->wVk;
                 if (!vk && (k->dwFlags & KEYEVENTF_SCANCODE)) vk = (int)MapVirtualKeyW(k->wScan, MAPVK_VSC_TO_VK_EX);
-                XsoPushInput(XSO_IN_KEY, vk, pressed, k->wScan, 0);
+                XsoPushInput(XSO_IN_KEY, vk, pressed, k->wScan, (k->dwFlags & KEYEVENTF_EXTENDEDKEY) ? 1 : 0);
             }
             sent++;
         } else {
@@ -783,7 +796,7 @@ EXPORT UINT API UwcGetWindowClassNameLength(int id){ WIN_OR(0); return (UINT)str
 EXPORT const char *API UwcGetWindowClassName(int id){ WIN_OR(NULL); return p->klass; }
 
 EXPORT ID3D11Texture2D *API UwcGetWindowTexturePtr(int id) { WIN_OR(NULL); return p->tex; }
-EXPORT void API UwcSetWindowTexturePtr(int id, ID3D11Texture2D *ptr) { WIN_OR(); p->tex = ptr; if (g_debug_mode) xlog("SetWindowTexturePtr id=%d %p", id, (void *)ptr); }
+EXPORT void API UwcSetWindowTexturePtr(int id, ID3D11Texture2D *ptr) { WIN_OR(); p->tex = ptr; p->tex_full_uploaded = NULL; if (g_debug_mode) xlog("SetWindowTexturePtr id=%d %p", id, (void *)ptr); }
 EXPORT ID3D11Texture2D *API UwcGetWindowIconTexturePtr(int id) { WIN_OR(NULL); return p->icon_tex; }
 EXPORT void API UwcSetWindowIconTexturePtr(int id, ID3D11Texture2D *ptr) { WIN_OR(); p->icon_tex = ptr; }
 

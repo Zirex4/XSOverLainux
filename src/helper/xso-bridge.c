@@ -21,6 +21,8 @@
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/Xrandr.h>
 #include <X11/extensions/XTest.h>
+#include <X11/extensions/Xdamage.h>
+#include <X11/extensions/Xrender.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/mman.h>
@@ -51,7 +53,14 @@ static int      g_verbose;
 static int      g_keep_alpha;
 static int      g_dry_input;   /* log input events instead of injecting them */
 static int      g_xerrors;
-static int      g_has_composite, g_has_shm, g_has_fixes, g_has_randr, g_has_xtest;
+static int      g_has_composite, g_has_shm, g_has_fixes, g_has_randr, g_has_xtest, g_has_damage;
+static int      g_damage_event_base;
+static Damage   g_root_damage;      /* desktops */
+static int      g_root_damaged;
+static int      g_no_damage;        /* --no-damage: always full captures */
+static double   g_scale = 1.0;      /* --scale F: server-side downscale of frames */
+static long     g_scale_above = 0;  /* --scale-above N: only scale frames with more than N pixels */
+static int      g_has_render;
 static int      g_randr_event_base;
 static uint32_t g_gen_counter = 1;
 
@@ -79,11 +88,86 @@ typedef struct {
 static shmimg_t g_imgs[N_IMGS];
 
 /* per table index helper state */
+typedef struct { int x, y, w, h; } rect_t;   /* w<=0 or h<=0 => empty */
+
 static struct {
     int      redirected;
     uint32_t served_req;
     uint32_t last_capture_ms;
+    Damage   dmg;            /* per-window damage (windows only) */
+    int      damaged;        /* NonEmpty notification seen since last fetch */
+    rect_t   drects[32];     /* fetched damage rectangles (frame coords) */
+    int      ndrects;        /* -1 => too many, use bbox in drects[0] */
+    int      drects_scaled;  /* rects already in scaled frame coords (cursor rects) */
+    double   cur_scale;      /* scale used for the current frame geometry */
+    int      need_full;      /* next capture must be a full frame */
+    rect_t   sync_rect;      /* region where the back half lags the front half */
+    rect_t   acc_dirty;      /* dirty region not yet acknowledged by the DLL */
+    uint32_t acc_seq;        /* frame_seq when acc_dirty was last published */
+    rect_t   cursor_rect;    /* where the cursor was drawn in the last frame (frame coords) */
+    rect_t   cursor_src_rect;/* same, source coords */
+    int      had_cursor;
 } g_wst[XSO_MAX_WINDOWS];
+
+static rect_t rect_union(rect_t a, rect_t b)
+{
+    if (a.w <= 0 || a.h <= 0) return b;
+    if (b.w <= 0 || b.h <= 0) return a;
+    int x0 = a.x < b.x ? a.x : b.x, y0 = a.y < b.y ? a.y : b.y;
+    int x1 = (a.x + a.w) > (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
+    int y1 = (a.y + a.h) > (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
+    rect_t r = { x0, y0, x1 - x0, y1 - y0 }; return r;
+}
+static rect_t rect_clip(rect_t a, int w, int h)
+{
+    int x0 = a.x < 0 ? 0 : a.x, y0 = a.y < 0 ? 0 : a.y;
+    int x1 = a.x + a.w > w ? w : a.x + a.w, y1 = a.y + a.h > h ? h : a.y + a.h;
+    rect_t r = { x0, y0, x1 - x0, y1 - y0 }; if (r.w < 0) r.w = 0; if (r.h < 0) r.h = 0; return r;
+}
+static int rect_empty(rect_t a) { return a.w <= 0 || a.h <= 0; }
+
+static void add_damage_rect(int idx, rect_t r)
+{
+    if (rect_empty(r)) return;
+    if (g_wst[idx].ndrects < 0) { g_wst[idx].drects[0] = rect_union(g_wst[idx].drects[0], r); return; }
+    if (g_wst[idx].ndrects >= 32) {
+        rect_t u = r; for (int k = 0; k < g_wst[idx].ndrects; k++) u = rect_union(u, g_wst[idx].drects[k]);
+        g_wst[idx].drects[0] = u; g_wst[idx].ndrects = -1; return;
+    }
+    g_wst[idx].drects[g_wst[idx].ndrects++] = r;
+}
+static rect_t damage_bbox(int idx)
+{
+    rect_t u = { 0, 0, 0, 0 };
+    if (g_wst[idx].ndrects < 0) return g_wst[idx].drects[0];
+    for (int k = 0; k < g_wst[idx].ndrects; k++) u = rect_union(u, g_wst[idx].drects[k]);
+    return u;
+}
+static void clear_damage(int idx) { g_wst[idx].ndrects = 0; g_wst[idx].damaged = 0; }
+
+/* Pull the pending damage region of `dmg` from the server and distribute its rectangles.
+   For the root damage every desktop entry gets the rectangles clipped to its monitor. */
+static void fetch_damage(Damage dmg, int idx /* -1 = root */)
+{
+    XserverRegion reg = XFixesCreateRegion(dpy, NULL, 0);
+    XDamageSubtract(dpy, dmg, None, reg);
+    int n = 0; XRectangle *rs = XFixesFetchRegion(dpy, reg, &n);
+    XFixesDestroyRegion(dpy, reg);
+    if (!rs) return;
+    for (int k = 0; k < n; k++) {
+        rect_t a = { rs[k].x, rs[k].y, rs[k].width, rs[k].height };
+        if (idx >= 0) add_damage_rect(idx, a);
+        else {
+            for (int i = 0; i < XSO_MAX_WINDOWS; i++) {
+                xso_window *w = &shm->windows[i];
+                if (!w->xid || !(w->flags & XSO_WF_DESKTOP) || w->frame_slot < 0) continue;
+                rect_t local = { a.x - w->x, a.y - w->y, a.w, a.h };
+                add_damage_rect(i, rect_clip(local, w->w, w->h));
+            }
+        }
+    }
+    XFree(rs);
+}
 
 static XFixesCursorImage *g_cursor_img;   /* cached */
 static uint32_t g_cursor_serial_ms;
@@ -526,6 +610,7 @@ static void remove_window(int idx)
     xso_window *e = &shm->windows[idx];
     DBG("remove window 0x%x (%d)", e->xid, idx);
     release_slot(idx);
+    if (g_wst[idx].dmg) { XDamageDestroy(dpy, g_wst[idx].dmg); g_wst[idx].dmg = 0; }
     if (g_wst[idx].redirected && !(e->flags & XSO_WF_DESKTOP)) {
         XCompositeUnredirectWindow(dpy, e->xid, CompositeRedirectAutomatic);
         g_wst[idx].redirected = 0;
@@ -588,6 +673,7 @@ static void enumerate_windows(void)
         }
         xso_window *e = &shm->windows[idx];
         present[idx] = 1;
+        if (!isnew && (e->w != o->w || e->h != o->h)) g_wst[idx].need_full = 1;
         e->flags = o->flags;
         e->x = o->fx; e->y = o->fy; e->w = o->fw; e->h = o->fh;
         /* XSOverlay maps clicks using the window rect; we capture the client area, so
@@ -705,6 +791,8 @@ static void release_slot(int idx)
     e->frame_slot = -1;
     g_slots[s].owner = -1; g_slots[s].owner_xid = 0;
     punch_frame_slot(s);
+    g_wst[idx].need_full = 1;
+    memset(&g_wst[idx].sync_rect, 0, sizeof(rect_t)); memset(&g_wst[idx].acc_dirty, 0, sizeof(rect_t));
 }
 
 static int ensure_slot(int idx)
@@ -712,7 +800,7 @@ static int ensure_slot(int idx)
     xso_window *e = &shm->windows[idx];
     if (e->frame_slot >= 0 && g_slots[e->frame_slot].owner == idx) return e->frame_slot;
     for (int s = 0; s < XSO_FRAME_SLOTS; s++) {
-        if (g_slots[s].owner < 0) { g_slots[s].owner = idx; g_slots[s].owner_xid = e->xid; e->frame_slot = s; return s; }
+        if (g_slots[s].owner < 0) { g_slots[s].owner = idx; g_slots[s].owner_xid = e->xid; e->frame_slot = s; g_wst[idx].need_full = 1; return s; }
     }
     /* evict the least recently requested */
     int victim = -1; uint32_t oldest = 0xFFFFFFFFu;
@@ -723,7 +811,7 @@ static int ensure_slot(int idx)
     }
     if (victim >= 0 && now_ms() - oldest > 1000) {
         release_slot(g_slots[victim].owner);
-        g_slots[victim].owner = idx; g_slots[victim].owner_xid = e->xid; e->frame_slot = victim;
+        g_slots[victim].owner = idx; g_slots[victim].owner_xid = e->xid; e->frame_slot = victim; g_wst[idx].need_full = 1;
         return victim;
     }
     return -1;
@@ -742,12 +830,13 @@ static void refresh_cursor_image(void)
 }
 
 /* blend the (premultiplied ARGB) cursor into a BGRA frame whose origin is (ox,oy) on screen */
-static void draw_cursor_into(uint32_t *frame, int fw, int fh, int ox, int oy)
+static rect_t draw_cursor_into(uint32_t *frame, int fw, int fh, int ox, int oy, double sc)
 {
+    rect_t none = { 0, 0, 0, 0 };
     refresh_cursor_image();
     XFixesCursorImage *ci = g_cursor_img;
-    if (!ci) return;
-    int cx = ci->x - ci->xhot - ox, cy = ci->y - ci->yhot - oy;
+    if (!ci) return none;
+    int cx = (int)((ci->x - ci->xhot - ox) * sc), cy = (int)((ci->y - ci->yhot - oy) * sc);
     for (int y = 0; y < (int)ci->height; y++) {
         int fy = cy + y; if (fy < 0 || fy >= fh) continue;
         for (int x = 0; x < (int)ci->width; x++) {
@@ -764,37 +853,170 @@ static void draw_cursor_into(uint32_t *frame, int fw, int fh, int ox, int oy)
             *dp = 0xFF000000u | (r << 16) | (g << 8) | b;
         }
     }
+    rect_t drawn = { cx, cy, (int)ci->width, (int)ci->height };
+    return rect_clip(drawn, fw, fh);
 }
 
-static int publish_frame(int idx, XImage *img, int w, int h, int ox, int oy)
+/* --- optional server-side downscale (XRender) ----------------------------------- */
+
+static double frame_scale(int w, int h)
+{
+    if (!g_has_render || g_scale >= 0.999) return 1.0;
+    if (g_scale_above > 0 && (long)w * h <= g_scale_above) return 1.0;
+    return g_scale;
+}
+
+static Pixmap    g_scale_pm;      /* reusable destination pixmap */
+static Picture   g_scale_pic;
+static int       g_scale_pm_w, g_scale_pm_h, g_scale_pm_depth;
+
+/* Render `src` (drawable with visual `vis`, depth `depth`) region sx,sy,sw,sh scaled by `sc` into the
+   shared pixmap and read it back as an image of dw x dh. Returns the image or NULL. */
+static XImage *read_scaled(Drawable src, Visual *vis, int depth, int sx, int sy, int sw, int sh, double sc, int *dw, int *dh, shmimg_t **out_si)
+{
+    int w = (int)(sw * sc + 0.5), h = (int)(sh * sc + 0.5);
+    if (w < 1) w = 1; if (h < 1) h = 1;
+    XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy, vis);
+    if (!fmt) return NULL;
+    if (!g_scale_pm || g_scale_pm_w < w || g_scale_pm_h < h || g_scale_pm_depth != depth) {
+        if (g_scale_pic) XRenderFreePicture(dpy, g_scale_pic);
+        if (g_scale_pm) XFreePixmap(dpy, g_scale_pm);
+        g_scale_pm_w = w > g_scale_pm_w ? w : g_scale_pm_w; g_scale_pm_h = h > g_scale_pm_h ? h : g_scale_pm_h; g_scale_pm_depth = depth;
+        g_scale_pm = XCreatePixmap(dpy, root, (unsigned)g_scale_pm_w, (unsigned)g_scale_pm_h, (unsigned)depth);
+        g_scale_pic = XRenderCreatePicture(dpy, g_scale_pm, fmt, 0, NULL);
+    }
+    Picture srcpic = XRenderCreatePicture(dpy, src, fmt, 0, NULL);
+    XTransform xf = {{ { XDoubleToFixed(1.0 / sc), 0, 0 }, { 0, XDoubleToFixed(1.0 / sc), 0 }, { 0, 0, XDoubleToFixed(1.0) } }};
+    XRenderSetPictureTransform(dpy, srcpic, &xf);
+    XRenderSetPictureFilter(dpy, srcpic, FilterBilinear, NULL, 0);
+    /* source coordinates are in the transformed space: (sx,sy) scaled */
+    XRenderComposite(dpy, PictOpSrc, srcpic, None, g_scale_pic, (int)(sx * sc), (int)(sy * sc), 0, 0, 0, 0, (unsigned)w, (unsigned)h);
+    XRenderFreePicture(dpy, srcpic);
+    shmimg_t *si = get_img(w, h, depth, vis);
+    if (!si) return NULL;
+    int before = g_xerrors;
+    if (!XShmGetImage(dpy, g_scale_pm, si->img, 0, 0, AllPlanes) || g_xerrors != before) return NULL;
+    *dw = w; *dh = h; *out_si = si;
+    return si->img;
+}
+
+/* Incremental publishing: begin() prepares the back half, copy_rect() stores the pixels of
+   one rectangle, end() draws the cursor, computes the dirty region and flips. */
+typedef struct { int idx, slot, w, h, ox, oy; uint32_t half; uint32_t *dst; rect_t changed; int full; } pub_t;
+
+static int publish_begin(pub_t *pb, int idx, int w, int h, int ox, int oy, int full)
 {
     xso_window *e = &shm->windows[idx];
-    int slot = e->frame_slot;
-    if (slot < 0) return 0;
-    uint32_t half = __atomic_load_n(&e->frame_buf, __ATOMIC_ACQUIRE) ^ 1u;
-    if (__atomic_load_n(&e->reader_buf, __ATOMIC_ACQUIRE) == half) return 0;   /* reader busy with it; retry later */
+    if (e->frame_slot < 0) return 0;
     if (w > XSO_FRAME_MAX_W) w = XSO_FRAME_MAX_W;
     if (h > XSO_FRAME_MAX_H) h = XSO_FRAME_MAX_H;
-    uint32_t *dst = (uint32_t *)XSO_FRAME_PTR(shm, slot, half);
-    int stride = w * 4;
+    uint32_t front_half = __atomic_load_n(&e->frame_buf, __ATOMIC_ACQUIRE);
+    uint32_t half = front_half ^ 1u;
+    if (__atomic_load_n(&e->reader_buf, __ATOMIC_ACQUIRE) == half) return 0;   /* reader busy; retry later */
+    pb->idx = idx; pb->slot = e->frame_slot; pb->w = w; pb->h = h; pb->ox = ox; pb->oy = oy; pb->half = half;
+    pb->dst = (uint32_t *)XSO_FRAME_PTR(shm, pb->slot, half); pb->full = full;
+    memset(&pb->changed, 0, sizeof pb->changed);
+    if (!full && !rect_empty(g_wst[idx].sync_rect)) {
+        const uint32_t *front = (const uint32_t *)XSO_FRAME_PTR(shm, pb->slot, front_half);
+        rect_t sr = rect_clip(g_wst[idx].sync_rect, w, h);
+        for (int y = 0; y < sr.h; y++)
+            memcpy(pb->dst + (size_t)(sr.y + y) * w + sr.x, front + (size_t)(sr.y + y) * w + sr.x, (size_t)sr.w * 4);
+    }
+    return 1;
+}
+
+static void publish_copy_rect(pub_t *pb, XImage *img, rect_t r)
+{
+    r = rect_clip(r, pb->w, pb->h);
+    if (rect_empty(r)) return;
     if (img->bits_per_pixel == 32) {
         const uint32_t amask = g_keep_alpha && img->depth == 32 ? 0u : 0xFF000000u;
-        for (int y = 0; y < h; y++) {
+        for (int y = 0; y < r.h; y++) {
             const uint32_t *src = (const uint32_t *)(img->data + (size_t)y * (size_t)img->bytes_per_line);
-            uint32_t *d = dst + (size_t)y * (size_t)w;
-            for (int x = 0; x < w; x++) d[x] = src[x] | amask;
+            uint32_t *d = pb->dst + (size_t)(r.y + y) * (size_t)pb->w + r.x;
+            for (int x = 0; x < r.w; x++) d[x] = src[x] | amask;
         }
     } else {
-        for (int y = 0; y < h; y++) {
-            uint32_t *d = dst + (size_t)y * (size_t)w;
-            for (int x = 0; x < w; x++) d[x] = 0xFF000000u | (uint32_t)XGetPixel(img, x, y);
+        for (int y = 0; y < r.h; y++) {
+            uint32_t *d = pb->dst + (size_t)(r.y + y) * (size_t)pb->w + r.x;
+            for (int x = 0; x < r.w; x++) d[x] = 0xFF000000u | (uint32_t)XGetPixel(img, x, y);
         }
     }
-    if (e->draw_cursor) draw_cursor_into(dst, w, h, ox, oy);
-    e->frame_w = w; e->frame_h = h; e->frame_stride = stride;
-    __atomic_store_n(&e->frame_buf, half, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&e->frame_seq, 1u, __ATOMIC_RELEASE);
+    pb->changed = rect_union(pb->changed, r);
+}
+
+static int publish_end(pub_t *pb)
+{
+    int idx = pb->idx; xso_window *e = &shm->windows[idx];
+    rect_t drawn = { 0, 0, 0, 0 };
+    if (e->draw_cursor) drawn = draw_cursor_into(pb->dst, pb->w, pb->h, pb->ox, pb->oy, g_wst[idx].cur_scale);
+    g_wst[idx].cursor_rect = drawn; g_wst[idx].had_cursor = !rect_empty(drawn);
+    rect_t fullr = { 0, 0, pb->w, pb->h };
+    rect_t changed = pb->full ? fullr : rect_union(pb->changed, drawn);
+    if (pb->full) g_wst[idx].acc_dirty = fullr;
+    else if (__atomic_load_n(&e->ack_seq, __ATOMIC_ACQUIRE) == g_wst[idx].acc_seq) g_wst[idx].acc_dirty = changed;
+    else g_wst[idx].acc_dirty = rect_union(g_wst[idx].acc_dirty, changed);
+    rect_t dr = rect_clip(g_wst[idx].acc_dirty, pb->w, pb->h);
+    e->dirty_x = dr.x; e->dirty_y = dr.y; e->dirty_w = dr.w; e->dirty_h = dr.h;
+    g_wst[idx].sync_rect = changed;
+    e->frame_w = pb->w; e->frame_h = pb->h; e->frame_stride = pb->w * 4;
+    __atomic_store_n(&e->frame_buf, pb->half, __ATOMIC_RELEASE);
+    g_wst[idx].acc_seq = __atomic_add_fetch(&e->frame_seq, 1u, __ATOMIC_RELEASE);
+    g_wst[idx].need_full = 0;
+    clear_damage(idx);
     return 1;
+}
+
+/* cursor rectangle in frame coordinates for a frame whose origin is (ox,oy) */
+static rect_t cursor_rect_for(int ox, int oy)
+{
+    rect_t r = { 0, 0, 0, 0 };
+    refresh_cursor_image();
+    if (!g_cursor_img) return r;
+    r.x = g_cursor_img->x - g_cursor_img->xhot - ox; r.y = g_cursor_img->y - g_cursor_img->yhot - oy;
+    r.w = g_cursor_img->width; r.h = g_cursor_img->height;
+    return r;
+}
+
+/* Decide what to read for this capture. Returns the number of rectangles in `out`
+   (0 = nothing changed). A full frame is a single rectangle. */
+static int plan_capture(int idx, int w, int h, int ox, int oy, rect_t *out, int maxn)
+{
+    xso_window *e = &shm->windows[idx];
+    rect_t full = { 0, 0, w, h };
+    int is_desktop = (e->flags & XSO_WF_DESKTOP) != 0;
+    { int srcw = is_desktop ? shm->monitors[e->monitor].w : e->w; g_wst[idx].cur_scale = (srcw > 0 && w < srcw) ? (double)w / srcw : 1.0; }
+    if (g_no_damage || g_wst[idx].need_full || !(is_desktop ? g_root_damage != 0 : g_wst[idx].dmg != 0)) { out[0] = full; return 1; }
+    if (is_desktop) { if (g_root_damaged) { fetch_damage(g_root_damage, -1); g_root_damaged = 0; } }
+    else if (g_wst[idx].damaged) { fetch_damage(g_wst[idx].dmg, idx); g_wst[idx].damaged = 0; }
+    if (e->draw_cursor) {
+        /* cursor rects are expressed in source coordinates like the damage rects */
+        rect_t c = cursor_rect_for(ox, oy);
+        rect_t prev = g_wst[idx].cursor_src_rect;
+        int moved = !g_wst[idx].had_cursor || c.x != prev.x || c.y != prev.y || c.w != prev.w || c.h != prev.h;
+        if (moved) { add_damage_rect(idx, c); if (g_wst[idx].had_cursor) add_damage_rect(idx, prev); }
+        g_wst[idx].cursor_src_rect = c;
+    }
+    /* damage rectangles come in source pixels; the frame may be scaled */
+    double sc = g_wst[idx].cur_scale;
+    int n = 0;
+    int cnt = g_wst[idx].ndrects < 0 ? 1 : g_wst[idx].ndrects;
+    for (int k = 0; k < cnt && n < maxn; k++) {
+        rect_t b = g_wst[idx].drects[k];
+        if (k >= 2 && g_wst[idx].ndrects >= 0 && 0) break;
+        if (sc < 1.0 && !(g_wst[idx].drects_scaled)) {
+            int x0 = (int)(b.x * sc) - 1, y0 = (int)(b.y * sc) - 1;
+            int x1 = (int)((b.x + b.w) * sc) + 2, y1 = (int)((b.y + b.h) * sc) + 2;
+            b.x = x0; b.y = y0; b.w = x1 - x0; b.h = y1 - y0;
+        }
+        b = rect_clip(b, w, h);
+        if (!rect_empty(b)) out[n++] = b;
+    }
+    if (n == 0) return 0;
+    /* if the rectangles cover most of the frame just do a full read */
+    long area = 0; for (int k = 0; k < n; k++) area += (long)out[k].w * out[k].h;
+    if (area > (long)w * h * 7 / 10) { out[0] = full; return 1; }
+    return n;
 }
 
 static int capture_desktop(int idx)
@@ -802,15 +1024,41 @@ static int capture_desktop(int idx)
     xso_window *e = &shm->windows[idx];
     const xso_monitor *m = &shm->monitors[e->monitor];
     if (ensure_slot(idx) < 0) return 0;
-    shmimg_t *si = get_img(m->w, m->h, DefaultDepth(dpy, screen), DefaultVisual(dpy, screen));
-    if (!si) return 0;
-    int before = g_xerrors;
-    uint64_t t0 = now_us();
-    if (!XShmGetImage(dpy, root, si->img, m->x, m->y, AllPlanes) || g_xerrors != before) { DBG("desktop XShmGetImage failed"); return 0; }
+    if (g_has_damage && !g_no_damage && !g_root_damage) {
+        g_root_damage = XDamageCreate(dpy, root, XDamageReportNonEmpty);
+        XSync(dpy, False);
+        DBG("root damage created");
+    }
+    double sc = frame_scale(m->w, m->h);
+    int fw = sc < 1.0 ? (int)(m->w * sc + 0.5) : m->w, fh = sc < 1.0 ? (int)(m->h * sc + 0.5) : m->h;
+    rect_t rs[32]; int n = plan_capture(idx, fw, fh, m->x, m->y, rs, 32);   /* rects in (scaled) frame coords */
+    if (n == 0) return 2;
+    int full = (n == 1 && rs[0].x == 0 && rs[0].y == 0 && rs[0].w == fw && rs[0].h == fh);
+    pub_t pb; if (!publish_begin(&pb, idx, fw, fh, m->x, m->y, full)) return 0;
+    uint64_t t0 = now_us(); long px = 0;
+    for (int k = 0; k < n; k++) {
+        if (sc < 1.0) {
+            /* expand the scaled rect to source coords with a 1px margin */
+            int sx = (int)(rs[k].x / sc) - 1, sy = (int)(rs[k].y / sc) - 1;
+            int sw = (int)((rs[k].w + 2) / sc) + 2, sh = (int)((rs[k].h + 2) / sc) + 2;
+            if (sx < 0) sx = 0; if (sy < 0) sy = 0; if (sx + sw > m->w) sw = m->w - sx; if (sy + sh > m->h) sh = m->h - sy;
+            int dw, dh; shmimg_t *si;
+            XImage *img = read_scaled(root, DefaultVisual(dpy, screen), DefaultDepth(dpy, screen), m->x + sx, m->y + sy, sw, sh, sc, &dw, &dh, &si);
+            if (!img) return 0;
+            rect_t dr = { (int)(sx * sc), (int)(sy * sc), dw, dh };
+            publish_copy_rect(&pb, img, dr); px += (long)dw * dh;
+        } else {
+            shmimg_t *si = get_img(rs[k].w, rs[k].h, DefaultDepth(dpy, screen), DefaultVisual(dpy, screen));
+            if (!si) return 0;
+            int before = g_xerrors;
+            if (!XShmGetImage(dpy, root, si->img, m->x + rs[k].x, m->y + rs[k].y, AllPlanes) || g_xerrors != before) { DBG("desktop XShmGetImage failed"); return 0; }
+            publish_copy_rect(&pb, si->img, rs[k]); px += (long)rs[k].w * rs[k].h;
+        }
+    }
     uint64_t t1 = now_us();
-    int r = publish_frame(idx, si->img, m->w, m->h, m->x, m->y);
-    if (g_verbose >= 2) LOG("desktop capture: getimage %llu us, publish %llu us (%s)", (unsigned long long)(t1 - t0), (unsigned long long)(now_us() - t1), r ? "ok" : "skipped");
-    return r;
+    int res = publish_end(&pb);
+    if (g_verbose >= 2) LOG("desktop capture: %d rect(s), %ld px%s%s, read %llu us, publish %llu us", n, px, full ? " (full)" : "", sc < 1.0 ? " (scaled)" : "", (unsigned long long)(t1 - t0), (unsigned long long)(now_us() - t1));
+    return res;
 }
 
 static int capture_window(int idx)
@@ -829,27 +1077,53 @@ static int capture_window(int idx)
             XCompositeRedirectWindow(dpy, e->xid, CompositeRedirectAutomatic);
             XSync(dpy, False);
             g_wst[idx].redirected = 1;
+            g_wst[idx].need_full = 1;
             DBG("redirected 0x%x", e->xid);
         }
+        if (g_has_damage && !g_no_damage && !g_wst[idx].dmg) {
+            g_wst[idx].dmg = XDamageCreate(dpy, e->xid, XDamageReportNonEmpty);
+            XSync(dpy, False);
+            g_wst[idx].need_full = 1;
+        }
+        double sc = frame_scale(a.width, a.height);
+        int fw = sc < 1.0 ? (int)(a.width * sc + 0.5) : a.width, fh = sc < 1.0 ? (int)(a.height * sc + 0.5) : a.height;
+        rect_t rs[32]; int n = plan_capture(idx, fw, fh, e->x, e->y, rs, 32);
+        if (n == 0) return 2;   /* unchanged */
+        int full = (n == 1 && rs[0].x == 0 && rs[0].y == 0 && rs[0].w == fw && rs[0].h == fh);
         before = g_xerrors;
         Pixmap pm = XCompositeNameWindowPixmap(dpy, e->xid);
         XSync(dpy, False);
         if (pm && g_xerrors == before) {
-            shmimg_t *si = get_img(a.width, a.height, a.depth, a.visual);
-            if (si) {
-                before = g_xerrors;
-                uint64_t t0 = now_us();
-                if (XShmGetImage(dpy, pm, si->img, 0, 0, AllPlanes) && g_xerrors == before) {
-                    uint64_t t1 = now_us();
-                    ok = publish_frame(idx, si->img, a.width, a.height, e->x, e->y);
-                    if (g_verbose >= 2) LOG("window 0x%x capture: getimage %llu us, publish %llu us (%s)", e->xid, (unsigned long long)(t1 - t0), (unsigned long long)(now_us() - t1), ok ? "ok" : "skipped");
+            pub_t pb;
+            if (publish_begin(&pb, idx, fw, fh, e->x, e->y, full)) {
+                uint64_t t0 = now_us(); long px = 0; int good = 1;
+                for (int k = 0; k < n && good; k++) {
+                    if (sc < 1.0) {
+                        int sx = (int)(rs[k].x / sc) - 1, sy = (int)(rs[k].y / sc) - 1;
+                        int sw = (int)((rs[k].w + 2) / sc) + 2, sh = (int)((rs[k].h + 2) / sc) + 2;
+                        if (sx < 0) sx = 0; if (sy < 0) sy = 0; if (sx + sw > a.width) sw = a.width - sx; if (sy + sh > a.height) sh = a.height - sy;
+                        int dw, dh; shmimg_t *si;
+                        XImage *img = read_scaled(pm, a.visual, a.depth, sx, sy, sw, sh, sc, &dw, &dh, &si);
+                        if (!img) { good = 0; break; }
+                        rect_t dr = { (int)(sx * sc), (int)(sy * sc), dw, dh };
+                        publish_copy_rect(&pb, img, dr); px += (long)dw * dh;
+                    } else {
+                        shmimg_t *si = get_img(rs[k].w, rs[k].h, a.depth, a.visual);
+                        if (!si) { good = 0; break; }
+                        before = g_xerrors;
+                        if (XShmGetImage(dpy, pm, si->img, rs[k].x, rs[k].y, AllPlanes) && g_xerrors == before) { publish_copy_rect(&pb, si->img, rs[k]); px += (long)rs[k].w * rs[k].h; }
+                        else good = 0;
+                    }
                 }
+                uint64_t t1 = now_us();
+                if (good) ok = publish_end(&pb);
+                if (g_verbose >= 2) LOG("window 0x%x capture: %d rect(s), %ld px%s%s, read %llu us, publish %llu us (%s)", e->xid, n, px, full ? " (full)" : "", sc < 1.0 ? " (scaled)" : "", (unsigned long long)(t1 - t0), (unsigned long long)(now_us() - t1), ok ? "ok" : "failed");
             }
             XFreePixmap(dpy, pm);
         }
     }
     if (!ok) {
-        /* fallback: whatever is on screen at the window rect */
+        /* fallback: whatever is on screen at the window rect (always a full frame) */
         int x = e->x, y = e->y, w = a.width, h = a.height;
         int sw = shm->hdr.screen_w, sh = shm->hdr.screen_h;
         if (x < 0) { w += x; x = 0; } if (y < 0) { h += y; y = 0; }
@@ -858,8 +1132,11 @@ static int capture_window(int idx)
         shmimg_t *si = get_img(w, h, DefaultDepth(dpy, screen), DefaultVisual(dpy, screen));
         if (!si) return 0;
         before = g_xerrors;
-        if (XShmGetImage(dpy, root, si->img, x, y, AllPlanes) && g_xerrors == before)
-            ok = publish_frame(idx, si->img, w, h, x, y);
+        rect_t full = { 0, 0, w, h };
+        if (XShmGetImage(dpy, root, si->img, x, y, AllPlanes) && g_xerrors == before) {
+            pub_t pb;
+            if (publish_begin(&pb, idx, w, h, x, y, 1)) { publish_copy_rect(&pb, si->img, full); ok = publish_end(&pb); }
+        }
     }
     return ok;
 }
@@ -941,6 +1218,37 @@ static KeyCode keycode_for_keysym(KeySym ks, int *need_shift)
 
 static KeyCode g_spare_keycode;
 
+/* PC set-1 scancode (as Wine's MapVirtualKey reports it) -> X keycode (evdev + 8). */
+static KeyCode scancode_to_keycode(int scan, int extended)
+{
+    if (!extended) {
+        if (scan >= 1 && scan <= 0x58) return (KeyCode)(scan + 8);       /* main block, 1:1 with evdev */
+        return 0;
+    }
+    switch (scan & 0xFF) {
+    case 0x1C: return 96 + 8;    /* KP_Enter */
+    case 0x1D: return 97 + 8;    /* RCtrl */
+    case 0x35: return 98 + 8;    /* KP_Divide */
+    case 0x37: return 99 + 8;    /* PrintScreen */
+    case 0x38: return 100 + 8;   /* RAlt / AltGr */
+    case 0x47: return 102 + 8;   /* Home */
+    case 0x48: return 103 + 8;   /* Up */
+    case 0x49: return 104 + 8;   /* PgUp */
+    case 0x4B: return 105 + 8;   /* Left */
+    case 0x4D: return 106 + 8;   /* Right */
+    case 0x4F: return 107 + 8;   /* End */
+    case 0x50: return 108 + 8;   /* Down */
+    case 0x51: return 109 + 8;   /* PgDn */
+    case 0x52: return 110 + 8;   /* Insert */
+    case 0x53: return 111 + 8;   /* Delete */
+    case 0x5B: return 125 + 8;   /* LWin */
+    case 0x5C: return 126 + 8;   /* RWin */
+    case 0x5D: return 127 + 8;   /* Menu */
+    case 0x46: return 119 + 8;   /* Pause (ctrl+break) */
+    default: return 0;
+    }
+}
+
 static void inject_keysym(KeySym ks, int pressed)
 {
     int shift = 0;
@@ -1005,8 +1313,14 @@ static void process_input(void)
             for (int i = 0; i < abs(notches); i++) { XTestFakeButtonEvent(dpy, btn, True, 0); XTestFakeButtonEvent(dpy, btn, False, 0); }
             break; }
         case XSO_IN_KEY: {
+            KeyCode kc = ev.c ? scancode_to_keycode(ev.c, ev.d) : 0;
+            if (kc) {
+                /* prefer the physical key: the X layout decides the character, which is what
+                   XSOverlay's key labels (computed by Wine from the same layout) promise */
+                KeySym probe = XkbKeycodeToKeysym(dpy, kc, 0, 0);
+                if (probe != NoSymbol) { XTestFakeKeyEvent(dpy, kc, ev.b ? True : False, 0); break; }
+            }
             KeySym ks = vk_to_keysym(ev.a);
-            if (ks == NoSymbol && ev.d) ks = (ev.d < 0x100) ? (KeySym)ev.d : (KeySym)(0x01000000 | ev.d);
             if (ks != NoSymbol) inject_keysym(ks, ev.b);
             break; }
         case XSO_IN_KEY_UNICODE: {
@@ -1073,9 +1387,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-vv")) g_verbose += 2;
         else if (!strcmp(argv[i], "--keep-alpha")) g_keep_alpha = 1;
         else if (!strcmp(argv[i], "--dry-input")) g_dry_input = 1;
+        else if (!strcmp(argv[i], "--no-damage")) g_no_damage = 1;
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) { g_scale = atof(argv[++i]); if (g_scale <= 0.1 || g_scale > 1.0) g_scale = 1.0; }
+        else if (!strcmp(argv[i], "--scale-above") && i + 1 < argc) g_scale_above = atol(argv[++i]);
         else if (!strcmp(argv[i], "--shm") && i + 1 < argc) path = argv[++i];
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            printf("usage: xso-bridge [-v] [--keep-alpha] [--dry-input] [--shm PATH]\n"); return 0;
+            printf("usage: xso-bridge [-v] [--keep-alpha] [--dry-input] [--no-damage] [--scale F] [--scale-above NPIXELS] [--shm PATH]\n"); return 0;
         }
     }
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGHUP, on_signal);
@@ -1094,7 +1411,10 @@ int main(int argc, char **argv)
     g_has_fixes = XFixesQueryExtension(dpy, &eb, &erb);
     g_has_randr = XRRQueryExtension(dpy, &g_randr_event_base, &erb);
     g_has_xtest = XTestQueryExtension(dpy, &eb, &erb, &maj, &min);
-    LOG("extensions: composite=%d shm=%d xfixes=%d randr=%d xtest=%d", g_has_composite, g_has_shm, g_has_fixes, g_has_randr, g_has_xtest);
+    g_has_damage = XDamageQueryExtension(dpy, &g_damage_event_base, &erb);
+    g_has_render = XRenderQueryExtension(dpy, &eb, &erb);
+    if (g_scale < 0.999) LOG("server-side scale %.2f%s", g_scale, g_scale_above ? " for large frames" : "");
+    LOG("extensions: composite=%d shm=%d xfixes=%d randr=%d xtest=%d damage=%d%s", g_has_composite, g_has_shm, g_has_fixes, g_has_randr, g_has_xtest, g_has_damage, g_no_damage ? " (disabled)" : "");
     if (!g_has_shm) { LOG("MIT-SHM is required"); return 1; }
     if (g_has_randr) XRRSelectInput(dpy, root, RRScreenChangeNotifyMask);
 
@@ -1117,6 +1437,10 @@ int main(int argc, char **argv)
             if (g_has_randr && ev.type == g_randr_event_base + RRScreenChangeNotify) {
                 XRRUpdateConfiguration(&ev);
                 update_monitors();
+            } else if (g_has_damage && ev.type == g_damage_event_base + XDamageNotify) {
+                XDamageNotifyEvent *de = (XDamageNotifyEvent *)&ev;
+                if (de->damage == g_root_damage) g_root_damaged = 1;
+                else for (int i = 0; i < XSO_MAX_WINDOWS; i++) if (g_wst[i].dmg == de->damage) { g_wst[i].damaged = 1; break; }
             }
         }
         if (t - last_mon >= 2000) { update_monitors(); last_mon = t; }
@@ -1136,7 +1460,8 @@ int main(int argc, char **argv)
             if (req == g_wst[i].served_req) continue;
             e->last_req_ms = t;
             busy = 1;
-            if (capture_window(i) || !(e->flags & XSO_WF_MAPPED) || e->frame_slot < 0) {
+            int cres = capture_window(i);
+            if (cres || !(e->flags & XSO_WF_MAPPED) || e->frame_slot < 0) {
                 g_wst[i].served_req = req;           /* served (or impossible right now) */
                 g_wst[i].last_capture_ms = t;
                 __atomic_store_n(&e->cap_done, req, __ATOMIC_RELEASE);
@@ -1160,6 +1485,7 @@ int main(int argc, char **argv)
                 if (e->xid && e->frame_slot >= 0 && t - e->last_req_ms > 5000) {
                     DBG("slot idle, releasing window 0x%x", e->xid);
                     release_slot(i);
+                    if (g_wst[i].dmg) { XDamageDestroy(dpy, g_wst[i].dmg); g_wst[i].dmg = 0; }
                     if (g_wst[i].redirected && !(e->flags & XSO_WF_DESKTOP)) {
                         XCompositeUnredirectWindow(dpy, e->xid, CompositeRedirectAutomatic);
                         g_wst[i].redirected = 0;

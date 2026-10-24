@@ -56,7 +56,7 @@ int main(int argc, char **argv)
     __atomic_add_fetch(&e->cap_req, 1u, __ATOMIC_RELEASE);
     while (__atomic_load_n(&e->frame_seq, __ATOMIC_ACQUIRE) == seq0 && now_ms() - t0 < 2000) usleep(1000);
     if (e->frame_seq == seq0) { printf("timeout (cap_req=%u cap_done=%u slot=%d)\n", e->cap_req, e->cap_done, e->frame_slot); return 1; }
-    printf("frame in %u ms: %dx%d stride %d slot %d buf %u\n", now_ms() - t0, e->frame_w, e->frame_h, e->frame_stride, e->frame_slot, e->frame_buf);
+    printf("frame in %u ms: %dx%d stride %d slot %d buf %u dirty %dx%d+%d+%d\n", now_ms() - t0, e->frame_w, e->frame_h, e->frame_stride, e->frame_slot, e->frame_buf, e->dirty_w, e->dirty_h, e->dirty_x, e->dirty_y);
     uint32_t half = e->frame_buf; e->reader_buf = half;
     const uint32_t *px = (const uint32_t *)XSO_FRAME_PTR(shm, e->frame_slot, half);
     write_ppm(out, px, e->frame_w, e->frame_h);
@@ -64,14 +64,16 @@ int main(int argc, char **argv)
     printf("wrote %s\n", out);
     /* timing: 60 captures */
     t0 = now_ms();
-    uint32_t mn = 1e9, mx = 0; int done = 0;
+    uint32_t mn = 1e9, mx = 0; int done = 0, frames = 0, unchanged = 0; long long dirty_px = 0;
     for (int k = 0; k < 60 && now_ms() - t0 < 5000; k++) {
         uint32_t s = e->frame_seq, ts = now_ms();
-        __atomic_add_fetch(&e->cap_req, 1u, __ATOMIC_RELEASE);
-        while (__atomic_load_n(&e->frame_seq, __ATOMIC_ACQUIRE) == s && now_ms() - ts < 2000) usleep(200);
+        uint32_t req = __atomic_add_fetch(&e->cap_req, 1u, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&e->frame_seq, __ATOMIC_ACQUIRE) == s && __atomic_load_n(&e->cap_done, __ATOMIC_ACQUIRE) != req && now_ms() - ts < 2000) usleep(200);
+        if (e->frame_seq != s) { frames++; dirty_px += (long long)e->dirty_w * e->dirty_h; e->ack_seq = e->frame_seq; } else unchanged++;
         uint32_t dt = now_ms() - ts; if (dt < mn) mn = dt; if (dt > mx) mx = dt; done++;
+        usleep(16000);
     }
-    printf("%d captures in %u ms (min %u max %u avg %.1f ms)\n", done, now_ms() - t0, mn, mx, (double)(now_ms() - t0) / done);
+    printf("%d requests in %u ms: %d new frames, %d unchanged (min %u max %u ms), avg dirty %lld px/frame\n", done, now_ms() - t0, frames, unchanged, mn, mx, frames ? dirty_px / frames : 0);
     /* cursor */
     uint32_t cs = shm->cursor.seq; __atomic_add_fetch(&shm->cursor.req, 1u, __ATOMIC_RELEASE);
     t0 = now_ms(); while (shm->cursor.seq == cs && now_ms() - t0 < 1000) usleep(1000);

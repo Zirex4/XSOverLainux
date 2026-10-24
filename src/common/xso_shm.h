@@ -13,7 +13,7 @@
 #include <stddef.h>
 
 #define XSO_SHM_MAGIC     0x4F53584Fu   /* "OXSO" */
-#define XSO_SHM_VERSION   1u
+#define XSO_SHM_VERSION   2u
 #define XSO_SHM_DEFAULT_PATH "/dev/shm/xso-bridge"
 
 #define XSO_MAX_WINDOWS   256
@@ -43,7 +43,7 @@
 #define XSO_IN_MOUSE_MOVE_REL 2   /* a=dx b=dy */
 #define XSO_IN_MOUSE_BUTTON   3   /* a=button(1..5) b=pressed */
 #define XSO_IN_MOUSE_WHEEL    4   /* a=delta (120 per notch) b=horizontal */
-#define XSO_IN_KEY            5   /* a=win vk b=pressed c=scancode d=unicode */
+#define XSO_IN_KEY            5   /* a=win vk b=pressed c=scancode d=extended(1) */
 #define XSO_IN_KEY_UNICODE    6   /* a=unicode b=pressed */
 #define XSO_IN_FOCUS_WINDOW   7   /* a=xid */
 #define XSO_IN_SHOW_WINDOW    8   /* a=xid b=cmd (SW_*) */
@@ -89,6 +89,10 @@ typedef struct xso_window {
     uint32_t reader_buf;          /* PE: half it is reading, or XSO_NO_INDEX */
     int32_t  frame_w, frame_h, frame_stride;
     uint32_t last_req_ms;         /* helper bookkeeping */
+    /* --- incremental updates (v2) --- */
+    int32_t  dirty_x, dirty_y, dirty_w, dirty_h;  /* region of the published frame that changed
+                                                     since the DLL's last acknowledged upload */
+    uint32_t ack_seq;             /* DLL: frame_seq it last uploaded */
 } xso_window;
 
 typedef struct xso_cursor {
@@ -142,7 +146,7 @@ typedef struct xso_shm {
 
 /* layout guards: both sides must agree */
 typedef char xso_assert_monitor_size[(sizeof(xso_monitor) == 800) ? 1 : -1];
-typedef char xso_assert_window_size[(sizeof(xso_window) == 764) ? 1 : -1];
+typedef char xso_assert_window_size[(sizeof(xso_window) == 784) ? 1 : -1];
 typedef char xso_assert_cursor_size[(sizeof(xso_cursor) == 36 + XSO_CURSOR_DIM * XSO_CURSOR_DIM * 4) ? 1 : -1];
 typedef char xso_assert_header_size[(sizeof(xso_header) == 120) ? 1 : -1];
 

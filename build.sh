@@ -7,7 +7,7 @@ cd "$here"
 mkdir -p build
 CFLAGS="-O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -I src/common"
 echo "[1/4] xso-bridge (native helper)"
-gcc $CFLAGS -o build/xso-bridge src/helper/xso-bridge.c -lX11 -lXcomposite -lXext -lXfixes -lXrandr -lXtst
+gcc $CFLAGS -o build/xso-bridge src/helper/xso-bridge.c -lX11 -lXcomposite -lXext -lXfixes -lXrandr -lXtst -lXdamage -lXrender
 echo "[2/4] uWindowCapture.dll (PE, winegcc/clang)"
 winegcc -b x86_64-w64-mingw32 -shared -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-unused-but-set-variable -I src/common \
     -o build/uWindowCapture.dll src/dll/uwc_linux.c -luser32 -lkernel32

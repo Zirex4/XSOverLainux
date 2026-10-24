@@ -45,3 +45,11 @@ checked and the approach reused for other Wine/Proton apps.
     for desktops and icon-less windows; desktops uploaded first.
 11. **Result.** From Steam, with SteamVR running: UI alive, API answering, 300+ frames
     captured and ~1000 input events forwarded during the user's VR session.
+12. **Usability pass (04:30–04:45).** XSOverlay's virtual keyboard sends VKs with scancodes
+    (WindowsInput `KeyDown/KeyUp`, never Unicode), so the helper now injects by scancode →
+    X keycode, matching the labels XSOverlay computes through Wine from the same X layout.
+    Capture became incremental: XDamage regions per window/root, multi-rectangle `XShmGetImage`,
+    dirty-rect `UpdateSubresource` in the DLL with an ack handshake (protocol v2). A Claude
+    (Electron) window went from 3 Mpx to ~0.1 Mpx read per frame; static windows cost nothing.
+    Optional XRender downscale (`--scale`) for full-screen games. Verified with `shmtest`,
+    the Proton harness (pixel-correct after 60 incremental frames) and live in VR.

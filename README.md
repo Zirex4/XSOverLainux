@@ -85,7 +85,7 @@ and XSOverlay's own `output_logs/` under
 | Variable | Effect |
 |---|---|
 | `XSO_BRIDGE_SHM` | shared-memory file (default `/dev/shm/xso-bridge`) |
-| `XSO_BRIDGE_ARGS` | extra args for `xso-bridge` (default `-v`; `-vv` logs every capture, `--keep-alpha`, `--dry-input`) |
+| `XSO_BRIDGE_ARGS` | extra args for `xso-bridge` (default `-v`). Useful: `--scale 0.75` (server-side XRender downscale of every frame), `--scale-above 2500000` (only scale frames larger than N pixels), `--no-damage` (always full captures), `-vv` (log every capture), `--keep-alpha`, `--dry-input` |
 | `XSO_DIRECT=0` | keep the Process Manager launcher |
 | `XSO_INPUT=0` | do not hook user32 input (no mouse/keyboard forwarding) |
 | `XSO_HOOKS=SendInput,SetCursorPos` | install only the listed hooks (bisecting) |
@@ -113,11 +113,13 @@ docs/DEVLOG.md            chronological account of the investigation
 
 ## Known limitations
 
-* **Performance.** Frames are read back through the X server (`XShmGetImage`). On the
-  test machine a 2560x1440 desktop takes ~25 ms when the GPU is idle but 100–150 ms while
-  VRChat and the SteamVR compositor are loading the GPU (7–10 fps for a full-desktop
-  overlay). Smaller windows are proportionally faster. Ideas: server-side scaling with
-  XRender before readback, or GLX `texture_from_pixmap` + PBO readback.
+* **Performance.** Frames are read back through the X server (`XShmGetImage`). Since v2
+  the helper uses XDamage and only reads/uploads the rectangles that changed, so static
+  windows cost nothing and typical app windows need a few percent of their area per frame.
+  A full-screen game still forces full desktop reads: 2560x1440 takes ~4 ms idle but 100 ms+
+  while VRChat and the SteamVR compositor load the GPU. For that case `--scale 0.75`
+  (or `--scale 0.5`) lets the X server downscale with XRender before the readback
+  (`XSO_BRIDGE_ARGS="-v --scale 0.75 --scale-above 2500000"` scales only big frames).
 * **UI only when launched by Steam.** The Vuplex Chromium webview that draws XSOverlay's UI
   spawns its GPU process fine inside Steam's runtime container but not when XSOverlay is
   started by hand with `proton run` (see docs/TESTING.md for how to test anyway).

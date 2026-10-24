@@ -44,10 +44,21 @@ that half (`reader_buf == half`, then it retries on the next loop), stores `fram
 then `frame_buf = half` (release) and `frame_seq++` (release). Pixels are BGRA with alpha
 forced to 255 unless `--keep-alpha`.
 
+Incremental frames (v2): the helper tracks damage with XDamage (`XDamageReportNonEmpty` on
+each captured window and on the root for desktops; the region is pulled with
+`XDamageSubtract` into an XFixes region and `XFixesFetchRegion`). Only the damaged
+rectangles are read with `XShmGetImage` and copied into the back half, after the back half
+has been brought up to date with the front half for the previously published rectangle
+(`sync_rect`). `dirty_x/y/w/h` hold the union of everything changed since the frame the DLL
+last acknowledged (`ack_seq`), so a slow reader never misses a region. An unchanged window
+produces no new frame (`cap_done` still advances). With `--scale` the frame is a
+downscaled copy produced by XRender on the server; damage rectangles are scaled accordingly.
+
 Frame consumption (DLL, render thread): on `frame_seq` change → if size differs from the
 last reported texture size → `WindowSizeChanged`; then, if a texture is set and its
 `D3D11_TEXTURE2D_DESC` matches, claim `reader_buf = frame_buf`, `UpdateSubresource`
-(swizzling to RGBA if the texture is `R8G8B8A8_*`), release, and emit `WindowCaptured`.
+(swizzling to RGBA if the texture is `R8G8B8A8_*`) of the dirty rectangle only (full frame
+the first time a texture pointer is seen), write `ack_seq`, release, and emit `WindowCaptured`.
 Missing texture → `TextureNullError` once per frame sequence; size mismatch →
 `TextureSizeError`.
 
@@ -65,10 +76,13 @@ to the cursor texture and emits `CursorCaptured` when the texture size matches.
 
 `input[512]` with `input_head` (producer, DLL) and `input_tail` (consumer, helper).
 Event types: `MOUSE_MOVE_ABS(x,y)`, `MOUSE_MOVE_REL(dx,dy)`, `MOUSE_BUTTON(btn 1..9, pressed)`,
-`MOUSE_WHEEL(delta ±120/notch, horizontal)`, `KEY(vk, pressed, scancode, unicode)`,
+`MOUSE_WHEEL(delta ±120/notch, horizontal)`, `KEY(vk, pressed, scancode, extended)`,
 `KEY_UNICODE(codepoint, pressed)`, `FOCUS_WINDOW(xid)`, `SHOW_WINDOW(xid, SW_*)`.
-The helper injects them with XTest (`XTestFakeMotionEvent/ButtonEvent/KeyEvent`; keysyms
-without a keycode are bound to a spare keycode on the fly), `_NET_ACTIVE_WINDOW` and
+The helper injects them with XTest (`XTestFakeMotionEvent/ButtonEvent/KeyEvent`). Keys are
+injected by **scancode → X keycode** (PC set-1 scancode + 8 for the main block, a small table
+for extended keys), so the X keyboard layout decides the character exactly like Wine's
+MapVirtualKey/ToUnicodeEx did when XSOverlay labelled its virtual keyboard; the VK → keysym
+table (and a spare keycode for unmapped keysyms) is only a fallback, `_NET_ACTIVE_WINDOW` and
 `XIconifyWindow`/`XMapRaised`. The DLL produces events from in-process hooks of
 `user32!SendInput`, `SetCursorPos`, `SetForegroundWindow` and `ShowWindow` (12-byte
 `mov rax, imm64; jmp rax` patches; the last two fall back to `win32u!NtUser*` for Wine HWNDs).
