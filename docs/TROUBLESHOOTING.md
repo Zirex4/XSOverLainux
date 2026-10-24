@@ -26,6 +26,11 @@ including XSOverlay receives `VR - QUIT - EVENT` and exits (wrapper log: `XSOver
 On this machine it fired right after opening/closing the SteamVR dashboard. `coredumpctl list
 vrcompositor` and `~/.local/share/Steam/logs/vrcompositor*.txt` (grep `ASSERT`) confirm it.
 
+**Confirmed independent of XSOverLainux**: with XSOverlay completely stopped, the compositor
+still aborted 36 s after the user put the headset on (2026-10-24 04:24). The two transfer sizes
+are exactly RGB screenshot images: 1060×728×3 = 2 315 040 (the preview) and 158×150×3 = 71 100
+(the thumbnail).
+
 On this machine the abort followed SteamVR **screenshot actions** (`Detected screenshot action,
 telling Dashboard to take a screenshot` → `Screenshot: Capturing Stereo2D texture` →
 `Failed to get the correct textures` → assert within 2–25 s). The Index controller chord for a
