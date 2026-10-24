@@ -26,15 +26,24 @@ including XSOverlay receives `VR - QUIT - EVENT` and exits (wrapper log: `XSOver
 On this machine it fired right after opening/closing the SteamVR dashboard. `coredumpctl list
 vrcompositor` and `~/.local/share/Steam/logs/vrcompositor*.txt` (grep `ASSERT`) confirm it.
 
-Reported workaround (issue #1006): with SteamVR closed, set in
-`~/.local/share/Steam/config/steamvr.vrsettings`
+On this machine the abort followed SteamVR **screenshot actions** (`Detected screenshot action,
+telling Dashboard to take a screenshot` → `Screenshot: Capturing Stereo2D texture` →
+`Failed to get the correct textures` → assert within 2–25 s). The Index controller chord for a
+screenshot is System + trigger, which is easy to hit while pointing at an overlay with the trigger
+held and pressing System to open the dashboard. Scripted dashboard open/close (`vrcmd
+--showdashboard/--hidedashboard`) with and without XSOverlay never reproduced it.
 
-```json
-"camera": { "enableCamera": false, "enableCameraForRoomView": false, "enableConstructRoomView": false }
+Mitigation that targets that trigger (applies live and is persisted to `steamvr.vrsettings`):
+
+```bash
+~/.local/share/Steam/steamapps/common/SteamVR/bin/linux64/vrcmd --set-settings-bool steamvr screenshots false
 ```
 
-(the transfer ring is also used for headset camera frames). Restart SteamVR. If it still happens,
-follow the issue for Valve's fix; downgrading does not help (older branches are affected too).
+The camera workaround reported in issue #1006 (`"camera": {"enableCamera": false,
+"enableCameraForRoomView": false, "enableConstructRoomView": false}`, SteamVR closed) did not help
+here. Downgrading does not help either (older branches are affected too); follow the issue for
+Valve's fix. The wrapper relaunches XSOverlay automatically when the compositor takes it down
+(`XSO_RELAUNCH`).
 
 Useful one-liners:
 
