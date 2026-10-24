@@ -16,6 +16,26 @@
 | Layout saving fails | `Process.GetProcessById` for a window pid | Already handled (own PID is returned); report if it recurs |
 | Steam "verify integrity" restored the original DLL | Expected | The wrapper reinstalls `build/uWindowCapture.dll` on the next launch |
 
+## vrcompositor aborts: `ASSERT: "Vulkan transfer ring buffer overflow; transfer size 71100!"` (or `2315040`)
+
+Not caused by XSOverLainux. This is SteamVR bug
+[ValveSoftware/SteamVR-for-Linux#1006](https://github.com/ValveSoftware/SteamVR-for-Linux/issues/1006)
+(SteamVR 2.16.7 – 2.18.4, all branches; reported on AMD/RADV, reproduced here on NVIDIA 615 with
+a Valve Index). The compositor dies with SIGABRT, the headset goes black, and every OpenVR app
+including XSOverlay receives `VR - QUIT - EVENT` and exits (wrapper log: `XSOverlay exited with 130`).
+On this machine it fired right after opening/closing the SteamVR dashboard. `coredumpctl list
+vrcompositor` and `~/.local/share/Steam/logs/vrcompositor*.txt` (grep `ASSERT`) confirm it.
+
+Reported workaround (issue #1006): with SteamVR closed, set in
+`~/.local/share/Steam/config/steamvr.vrsettings`
+
+```json
+"camera": { "enableCamera": false, "enableCameraForRoomView": false, "enableConstructRoomView": false }
+```
+
+(the transfer ring is also used for headset camera frames). Restart SteamVR. If it still happens,
+follow the issue for Valve's fix; downgrading does not help (older branches are affected too).
+
 Useful one-liners:
 
 ```bash

@@ -131,6 +131,13 @@ docs/DEVLOG.md            chronological account of the investigation
   under Wine; harmless.
 * **X11 only.** A Wayland backend would live in the helper (PipeWire / xdg-desktop-portal).
 
+## If SteamVR itself crashes
+
+If the headset goes black and XSOverlay exits a few minutes after you start interacting, check
+`~/.local/share/Steam/logs/vrcompositor.txt` for `ASSERT: "Vulkan transfer ring buffer overflow"`.
+That is SteamVR bug [#1006](https://github.com/ValveSoftware/SteamVR-for-Linux/issues/1006), not
+this project; see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for the camera workaround.
+
 ## Uninstall
 
 ```bash
